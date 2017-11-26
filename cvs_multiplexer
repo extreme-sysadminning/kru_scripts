@@ -1,0 +1,9 @@
+#! /bin/sh
+exec /usr/pkg/bin/cvs -f \
+--allow-root=/home/karsten/cvsroot \
+--allow-root=/home/cvs_newbienet/cvsroot \
+--allow-root=/home/cvs/cvsroot \
+--allow-root=/home/cvs_mu/cvsroot \
+--allow-root=/home/sagot/cvsroot \
+--allow-root=/home/cvs_tecpsion/cvsroot \
+pserver
