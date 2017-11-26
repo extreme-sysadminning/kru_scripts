@@ -1,0 +1,154 @@
+#!/bin/sh
+
+# dvd2divx - convert dvd's to divx - www.tecneeq.de
+
+# TODO:
+#   - find the most likely track
+#   - implement 2pass
+
+#  Copyright (c) 2004, Karsten Kruse <tecneeq(at)tecneeq(dot)de>
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#  1. Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following  disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in
+#     the documentation and/or other materials provided with the
+#     distribution.
+#  3. Neither the name of the author nor the names of its contributors
+#     may be used to endorse or promote products derived from this
+#     software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+#  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+#  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+#  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+#  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+#  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+###### HARDWIRED DEFAULTS
+bitrate=950          # mencoder defaults to 800 here!
+track=1              # defaulttrack
+test=200             # default testseconds
+source=/dev/dvd      # default source
+lang=de              # default language
+quiet=no             # by default we are not quiet
+testseconds=0        # if 0 we don't test
+twopass=no           # use 2pass?
+###### HARDWIRED DEFAULTS
+
+# display a message and exit
+ups(){
+    echo "`basename $0`: Error: $1"
+    exit 1
+}
+
+# show some useage-info
+usage(){
+cat <<END
+
+ Usage: `basename $0` [Options]
+
+  -o <output>  => resulting video-file, append .avi
+  -s <source>  => a device-file or dvd-imagefile    => defaults to $source
+  -t <track>   => the dvd-track to encode           => defaults to $track
+  -b <bitrate> => the more, the better/bigger, kb/s => defaults to $bitrate
+  -l <lang>    => sound-language used (de, en)      => defaults to $lang
+  -p <seconds> => encode some seconds to preview    => defaults to $testseconds
+  -q           => show informations while running   => defaults to $quiet
+  -2           => use 2pass encoding                => defaults to $twopass
+
+  Encode dvd.img to test.avi, 700kb/s bitrate and only 150 seconds:
+   `basename $0` -s dvd.img     -o test.avi  -p 150  -b 700
+
+  Encode /dev/dvdrom to movie.avi (using the defaults, but german language):
+   `basename $0` -s /dev/dvdrom -o movie.avi -l de
+
+  Encode /dev/dvdrom, track 2, with 900kb/s bitrate to flic.avi:
+   `basename $0` -s /dev/dvdrom -o movie.avi -b 1100  -t 2
+
+  Encode dvd.img to movie.avi using the 2pass encoding:
+   `basename $0` -s dvd.img     -o movie.avi -2
+
+END
+}
+
+# test mencoder for lavc- and mp3lame-support
+mencoder -ovc help 2>/dev/null | grep lavc >/dev/null || \
+	ups "lavc is not available in mencoder"
+mencoder -oac help 2>/dev/null | grep mp3lame >/dev/null || \
+	ups "mp3lame is not available in mencoder"
+
+# parse commandline
+while getopts hq2s:o:t:b:l:p: opt ; do
+    case "$opt" in
+        h)      usage ; exit          ;;
+        q)      quiet=yes ;;
+        2)      twopass=yes ;;
+        s)      source="$OPTARG"      ;;
+        o)      output="$OPTARG"      ;;
+        t)      track="$OPTARG"       ;;
+        b)      bitrate="$OPTARG"     ;;
+        l)      lang="$OPTARG"        ;;
+        p)      testseconds="$OPTARG" ;;
+        \?)     usage >&2 ; exit 1    ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+# do we have a sourcefile?
+if [ ! -r "$source" ] ; then ups "could not read $source" ; fi
+
+# are we able to produce output?
+if [ -z $output ] ; then ups "no outputfile specified" ; fi
+touch "$output" 2>/dev/null
+if [ ! $? = 0 ] ; then ups "could not write to $output" ; fi
+rm "$output"
+
+# are we quiet or what?
+opt_quiet=""
+if [ $quiet = yes ] ; then opt_quiet="-quiet" ; fi
+
+# are we running a test?
+if [ ! $testseconds = 0 ] ; then opt_test="-endpos $testseconds" ; fi
+
+one_pass()
+{
+nice mencoder $opt_quiet $opt_test -sws 2 \
+    dvd://${track} -dvd-device "${source}" \
+    -o "${output}" -vf scale -zoom -xy 480 \
+    -ovc lavc -lavcopts vcodec=mpeg4:vbitrate=${bitrate}:mbd=1:v4mv \
+    -alang $lang -a52drc 1 -oac mp3lame -lameopts preset=128
+}
+
+two_pass()
+{
+passlog="`dirname ${output}`/divx2pass.log"
+nice mencoder $opt_quiet $opt_test -sws 2 \
+    dvd://${track} -dvd-device "${source}" \
+    -o "${output}" -vf scale -zoom -xy 480 -passlogfile "$passlog" \
+    -ovc lavc -lavcopts vcodec=mpeg4:vbitrate=${bitrate}:mbd=1:v4mv:vpass=1 \
+    -alang $lang -a52drc 1 -oac mp3lame -lameopts preset=128
+nice mencoder $opt_quiet $opt_test -sws 2 \
+    dvd://${track} -dvd-device "${source}" \
+    -o "${output}" -vf scale -zoom -xy 480 -passlogfile "$passlog" \
+    -ovc lavc -lavcopts vcodec=mpeg4:vbitrate=${bitrate}:mbd=1:v4mv:vpass=2 \
+    -alang $lang -a52drc 1 -oac mp3lame -lameopts preset=128
+rm "$passlog"
+}
+
+case $twopass in
+    yes) two_pass ;;
+    no)  one_pass ;;
+esac
+
+#eof
