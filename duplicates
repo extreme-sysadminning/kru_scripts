@@ -1,0 +1,235 @@
+#!/bin/sh
+
+# duplicates - find duplicate files
+#
+# http://www.tecneeq.de/files/shell/duplicates/
+#
+# BUGS:
+#  - we can't deal with new lines in filenames
+#
+# TODO:
+#  - accept directorys from commandline instead of just using ./
+#  - accept a list of files to compare on stdin
+#  - if we have only two files of the same size we should use cmp,
+#    wich is faster than md5sum because it stops comparing at the
+#    first difference, while md5sum reads the whole file. Problem
+#    is when we have more than two files with the same size, cmp
+#    would have to read some files more than once, wich gives the
+#    advantage back to md5sum.
+#  - write manpage
+#  - make the script portable (BSD,OSX,Solaris,Linux)
+#
+# The program begins by evaluating each file by its file size. A
+# dictionary containing lists of potential duplicates is built as
+# the file system is scanned. From this dictionary, a list of
+# lists is built for each set of one or more files that are the
+# same size. Next, the sets of potential duplicates are evaluated
+# twice by calculating md5 hash values. In the first pass, we only
+# process the first 1024 bytes of each file. The reason for this
+# abbreviated pass is that many files may have the same size and
+# calculating hash values is fairly slow. So the first pass makes
+# a quick determination to eliminate many non-duplicates. To be
+# certain that the files are duplicates, the second pass compares
+# each set by calculating the md5 hash value for the whole file.
+
+#  Copyright (c) 2008-2011,2014 Karsten Kruse <tecneeq(at)tecneeq.de>
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#  1. Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following  disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in
+#     the documentation and/or other materials provided with the
+#     distribution.
+#  3. Neither the name of the author nor the names of its contributors
+#     may be used to endorse or promote products derived from this
+#     software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+#  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+#  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+#  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+#  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+#  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+set -e
+set -u
+#set -x
+
+# init some vars we use later
+my_name=$(basename $0)
+my_version="04"
+number_to_consider="0"
+my_tempdir="${TMPDIR:=/tmp}/${my_name}_$$"
+#my_tempdir="${TMPDIR:=/tmp}/${my_name}"
+foundfiles=${my_tempdir}/allfiles.txt
+considerfiles=${my_tempdir}/consider.txt
+md5sums=${my_tempdir}/md5sums.txt
+originals=${my_tempdir}/unique.txt
+deletable=${my_tempdir}/delete.txt
+GIVEN_DIR=unset
+BE_QUIET=unset
+DELETE_DUPES=unset
+HARDLINK_DUPES=unset
+MOVE_DUPES=unset
+NO_FILEOPS=unset
+nofileops=""
+outputcmd=echo
+verboseopt="-v"
+
+func_usage() {
+cat <<END
+
+ $1 - find duplicate files
+
+ Options:
+  -h       => print this help
+  -d <dir> => search in <dir> instead of current working directory
+  -r       => find duplicates and remove them
+  -l       => find duplicates and hardlink them
+  -m <dir> => find duplicates and move them to <dir>
+  -q       => be quit
+  -x       => no file operations, used to see what -d, -l or -m would do
+  -v       => print version
+
+ Examples:
+  $1            => list duplicates in current directory
+  $1 -d /mnt    => list duplicates in /mnt
+  $1 -m /tmp    => move duplicates to /tmp
+  $1 -m /tmp -l => move duplicates to /tmp and create hardlinks
+  $1 -l         => hardlink duplicates
+  $1 -r         => just remove duplicates
+  $1 -m /tmp -x => debug the -m switch
+
+END
+}
+
+func_testdir() {
+  if [ ! -d "$2" ] ; then
+    echo >&2 "The directory you specified with $1 does not exist."
+    exit 1
+  fi
+}
+
+# parse commandline
+while getopts hd:rlm:qxv option ; do
+  case "$option" in
+    h) func_usage $my_name ; exit ;;
+    d) GIVEN_DIR=set ; SEARCHDIR="$OPTARG" ; func_testdir -d "$SEARCHDIR" ;;
+    r) DELETE_DUPES=set ;;
+    l) HARDLINK_DUPES=set ;;
+    m) MOVE_DUPES=set MOVEDIR="$OPTARG" ; func_testdir -m "$MOVEDIR";;
+    q) BE_QUIET=set ;;
+    x) NO_FILEOPS=set ;;
+    v) echo $my_name $my_version ; exit ;;
+    \?) func_usage $my_name >&2 ; exit 1 ;;
+  esac
+done
+shift $(expr $OPTIND - 1)
+
+# make sure tempfiles are removed at program termination or
+# after we received a signal:
+trap 'rm -rf "$my_tempdir" >/dev/null 2>&1' 0
+trap "exit 2" 1 2 3 6 13 15
+
+mkdir $my_tempdir
+
+# we debug a command by putting echo in front of it
+if [ $NO_FILEOPS = set ] ; then
+  # add verbosity by unsetting BE_QUIET
+  BE_QUIET=unset
+  nofileops=echo
+fi
+
+# if quietness is requested we override "echo" commands with ":" and "-v"
+# arguments with ""
+if [ $BE_QUIET = set ] ; then
+  outputcmd=":"
+  verboseopt=""
+fi
+
+$outputcmd -n "Searching files (this filesystem only)  ... "
+if [ ! $GIVEN_DIR = set ] ; then
+  SEARCHDIR="."
+fi
+{
+  find $SEARCHDIR -links +1 -type f ! -type d -printf "%12i%12s\t%p\n" \
+    | sort -k 1.1,1.12 -n | uniq -w 12 | cut -c 13-
+  find $SEARCHDIR -mount -type f -a -links 1 -printf "%12s\t%p\n"
+} > $foundfiles
+$outputcmd "$(wc -l < $foundfiles) files to consider."
+
+$outputcmd -n "Sorting files by size, removing uniques ... "
+sort -k 1.1,1.12 -n < $foundfiles | uniq -D -w 12 > $considerfiles
+number_to_consider=$(wc -l < $considerfiles)
+if [ $number_to_consider -lt 2 ] ; then
+  $outputcmd "all files unique. Exit."
+  exit
+else
+  $outputcmd "$number_to_consider files left."
+fi
+
+# cut out filename, replace newline, calculate md5, replace spaces with tab
+# and feed to sort
+$outputcmd -n "Calculating md5sums (this takes time)   ... "
+cut -f 2 $considerfiles \
+  | tr "\n" "\000" \
+  | xargs -0 md5sum \
+  | sed 's/  /\t/' \
+  | sort > $md5sums
+$outputcmd "$(wc -l < $md5sums) md5sums calculated."
+
+$outputcmd -n "Generating list of files to delete      ... "
+# only one of the dupes can be the original
+uniq -w 32 -d $md5sums > $originals
+uniq -w 32 -D $md5sums \
+  | comm -3 - $originals > $deletable
+number_to_delete=$(wc -l < $deletable)
+$outputcmd "$number_to_delete files are duplicates."
+[ $number_to_delete = 0 ] && exit
+
+# print duplicates
+if [ ! "$BE_QUIET" = set ] ; then
+  join -t "$(printf "\t")" $originals $deletable \
+    | cut -f 2- \
+    | tr "\t" " " \
+    | sed 's/^/duplicates: /'
+fi
+
+# let's start file operations
+if [ $MOVE_DUPES = set ] ; then
+  DELETE_DUPES=unset # mv leaves no duplicates, so we can skip deletion
+  $outputcmd "Moving duplicates to $MOVEDIR ..."
+  cut -f 2- $deletable \
+  | tr "\n" "\000" \
+  | xargs -0 -n 50 $nofileops mv $verboseopt --target-directory="$MOVEDIR"
+  $outputcmd "done."
+fi
+
+if [ $HARDLINK_DUPES = set ] ; then
+  DELETE_DUPES=unset # ln leaves no duplicates, so we can skip deletion
+  $outputcmd "Creating hardlinks ... "
+  join -t "$(printf "\t")" $originals $deletable \
+    | cut -f 2- \
+    | tr "\n\t" "\000\000" \
+    | xargs -0 -n 2 $nofileops ln $verboseopt -f
+  $outputcmd "done."
+fi
+if [ $DELETE_DUPES = set ] ; then
+  $outputcmd "Deleting duplicates ... "
+  cut -f 2- $deletable \
+  | tr "\n" "\000" \
+  | xargs -0 $nofileops rm $verboseopt
+  $outputcmd "done."
+fi
+
+# eof
